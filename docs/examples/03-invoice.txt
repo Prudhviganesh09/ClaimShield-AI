@@ -1,0 +1,13 @@
+SYNTHETIC LOCAL TEST ONLY - NOT A REAL INVOICE
+Itemised invoice and payment receipt
+Invoice number: TEST-INVOICE-001
+Claim number: LOCAL-TEST-001
+Patient: Test Patient Alpha
+Provider: Fictional Test Clinic
+Service date: 25 September 2026
+Item: outpatient consultation
+Quantity: 1
+Unit price: INR 1,000
+Total billed: INR 1,000
+Total paid: INR 1,000
+Payment status: paid in full.

@@ -5,14 +5,16 @@ PostgreSQL at the user's request. No local production database or model containe
 
 ## Passed
 
-- 57 automated tests: provider payloads, retry/backoff/fallback, structured JSON validation/repair, token limits,
+- 64 automated tests: provider payloads, retry/backoff/fallback, structured JSON validation/repair, token limits,
   passage/query embeddings, batching/caching, cancellation deduplication, document extraction/OCR line boundaries,
   concurrent duplicate uploads, tenant isolation, saved originals and previous reports surviving provider outages,
   reindexing after model changes, exact citations, semantic rejection, review persistence, usage aggregation,
   synthetic document ingestion, PostgreSQL/pgvector query compilation, migration/RLS SQL compilation,
   Supabase CA/hostname verification, valid appeals without separate findings, rejected-response regeneration,
   bounded grounding correction with re-verification, mandatory vision transcription fields, and rejection of
-  unsupported appeal-timeliness assertions even when the model's semantic reviewer accepts them.
+  unsupported appeal-timeliness assertions even when the model's semantic reviewer accepts them. Added
+  regression cases cover retaining a verified subset, rejecting a failed final review, invalid/missing reviewer
+  indexes and contradictory verdicts, preventing an empty appeal, and warnings in partial appeal exports.
 - Ruff checks for backend and scripts; Python package dependency consistency.
 - TypeScript checking and Next.js optimized production build.
 - npm production dependency audit reported zero known vulnerabilities during this verification run.
@@ -50,9 +52,15 @@ PostgreSQL at the user's request. No local production database or model containe
 
 Vision metadata could omit the transcription field; it is now required. A valid cited appeal without a separate
 findings list could be rejected; all evidence-bearing conclusion types are now accepted. Rejected responses
-could remain cached; only fully verified reports are cached. Semantic verification now receives the cited source
+could remain cached; only reports whose retained conclusions pass verification are cached. Semantic verification now receives the cited source
 context as well as short quotations. One bounded grounding correction is permitted, with full re-verification
 before saving. The frontend review form now tracks saved server status while preserving unsaved edits.
+Intermittent semantic rejection could discard supported conclusions alongside an unsupported one. The reviewer
+now receives explicit conclusion indexes and returns specific rejection reasons. After one regeneration,
+explicitly rejected conclusions may be omitted, followed by a final independent review of the remaining subset.
+Only a passing subset is saved, with an incomplete-result warning in the page and appeal export and confidence
+capped at 49. Ambiguous verdicts, empty subsets, and failed final checks still save nothing. The persistent cache
+version was advanced so older results cannot mask this change.
 Next.js's default 30-second rewrite proxy timeout could interrupt browser requests while the backend completed
 them successfully. It is now 600 seconds, matching the client and gateway inference timeout.
 Appeal export now uses an authenticated server download rather than a short-lived browser Blob URL.
@@ -86,6 +94,13 @@ Native Tesseract 5.5.0 inside the backend container successfully read a generate
 also ran as UID 10001 and could write its mounted upload directory. This verifies native container OCR; Tesseract
 is still not installed directly on Windows. Idle observed memory was approximately 96 MiB backend, 37 MiB
 frontend, and 18 MiB Nginx; these observations are not peak-load measurements or EC2 sizing guarantees.
+
+After the semantic-rejection recovery change, the AMD64 application images were rebuilt and all three services
+started successfully. All 26 HTTP checks passed against the existing four-document fictional claim using real
+Supabase and NVIDIA: fresh analysis, evidence answer and appeal under cache version v4, exact citations, cache
+reuse, appeal download, prior-result preservation, persisted new results, logout and anonymous-export rejection.
+See `data/verification/grounding-recovery-live-check.json`. These live responses passed without needing subset
+recovery; recovery and its rejection boundaries are covered by the automated regression tests.
 
 The ignored root `.env` now contains the supplied Supabase API credentials, the project URL derived from their
 project reference, the user's existing NVIDIA key, generated JWT/admin secrets, localhost origins, development

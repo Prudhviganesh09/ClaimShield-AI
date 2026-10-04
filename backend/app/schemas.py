@@ -1,7 +1,7 @@
 import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 
 class StrictSchema(BaseModel):
@@ -95,6 +95,12 @@ class GroundedResponse(StrictSchema):
     appeal_paragraphs: list[Finding] = Field(default_factory=list, max_length=10)
 
 
+class EvidenceIssue(StrictSchema):
+    index: int = Field(ge=0, strict=True)
+    reason: str = Field(min_length=1, max_length=700)
+
+
 class EvidenceVerification(StrictSchema):
     supported: bool
-    unsupported_indexes: list[int] = Field(default_factory=list)
+    unsupported_indexes: list[StrictInt] = Field(default_factory=list, max_length=34)
+    issues: list[EvidenceIssue] = Field(default_factory=list, max_length=34)

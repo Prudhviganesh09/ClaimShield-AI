@@ -92,6 +92,7 @@ function AnalysisPanel({analysis, revision}: {analysis: Analysis; revision: numb
       <div className="score"><strong>{value.assessment.evidence_confidence}<small>/100</small></strong><span>Evidence quality</span></div></div>
     {revision !== value.evidence_revision && <div className="notice warning"><Clock3 size={18}/>This report predates changes to the evidence. Run a new analysis to include them.</div>}
     {value.insufficient_evidence && <div className="notice warning"><AlertTriangle size={18}/>The evidence is insufficient for a complete assessment.</div>}
+    {value.verification_notes?.map((note, i) => <div className="notice warning" key={i}><AlertTriangle size={18}/>{note}</div>)}
     <p className="muted small">{value.assessment.confidence_explanation}</p>
     <h4>Supported findings</h4><Findings items={value.findings} sources={value.sources}/>
     {!!value.recommendations.length && <><h4>Recommended next steps</h4><Findings items={value.recommendations} sources={value.sources}/></>}

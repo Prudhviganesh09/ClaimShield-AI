@@ -380,6 +380,81 @@ async def test_grounding_correction_is_bounded_and_reverified_before_saving(app)
             assert await session.scalar(select(Analysis)) is not None
 
 
+@pytest.mark.parametrize("case", ["retained", "rejected_again", "invalid_index", "no_indexes",
+                                  "contradictory_verdict", "no_appeal", "partial_appeal"])
+async def test_rejected_subset_is_reverified_and_incomplete_result_is_disclosed(app, case):
+    async with client(app) as c:
+        claim_id = await make_claim(c)
+        await upload(c, claim_id)
+        await finish_jobs(app)
+        previous_handler = app.state.ai.provider.client._transport.handler
+        reviews, generations = [], []
+        reason = "The denial does not establish coverage or claim payability."
+        def handler(request):
+            body = json.loads(request.content)
+            if "messages" not in body:
+                return previous_handler(request)
+            prompt = json.loads(body["messages"][-1]["content"])
+            if "unsupported_indexes" in body["messages"][0]["content"]:
+                reviews.append(prompt)
+                if len(reviews) <= 2:
+                    index = 99 if case == "invalid_index" else 1
+                    value = {"supported": case == "contradictory_verdict",
+                             "unsupported_indexes": [] if case == "no_indexes" else [index],
+                             "issues": [] if case == "no_indexes" else [{"index": index, "reason": reason}]}
+                else:
+                    value = {"supported": case != "rejected_again",
+                             "unsupported_indexes": [0] if case == "rejected_again" else []}
+            else:
+                generations.append(prompt)
+                response = previous_handler(request)
+                value = json.loads(response.json()["choices"][0]["message"]["content"])
+                supported = value["findings"][0]
+                unsupported = {**supported, "statement": "The claim is covered and payable."}
+                if case == "partial_appeal":
+                    value["findings"] = []
+                    value["appeal_paragraphs"] = [supported, unsupported]
+                elif case == "no_appeal":
+                    value["appeal_paragraphs"] = [unsupported]
+                else:
+                    value["recommendations"] = [unsupported]
+            return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(value)}}]})
+        app.state.ai.provider.client._transport = httpx.MockTransport(handler)
+        kind = "appeal" if case in {"partial_appeal", "no_appeal"} else "analyze"
+        path = f"/api/claims/{claim_id}/{kind}"
+        response = await c.post(path)
+        assert len(generations) == 2
+        if case not in {"invalid_index", "no_indexes"}:
+            feedback = json.loads(generations[1]["verification_feedback"]["untrusted_diagnostic"])
+            assert feedback["unsupported_statements"][0]["reason"] == reason
+        if case in {"retained", "partial_appeal", "rejected_again"}:
+            assert len(reviews) == 3
+            assert len(reviews[2]["conclusions"]) == 1
+            assert reviews[2]["conclusions"][0]["index"] == 0
+            assert reviews[2]["conclusions"][0]["statement"] != "The claim is covered and payable."
+        else:
+            assert len(reviews) == 2
+        if case in {"retained", "partial_appeal"}:
+            assert response.status_code == 200, response.text
+            report = response.json()
+            result = report["result"]
+            assert result["insufficient_evidence"] and result["verification_notes"]
+            assert result["assessment"]["evidence_confidence"] <= 49
+            assert result["recommendations"] == []
+            assert "payable" not in json.dumps(result)
+            if case == "partial_appeal":
+                assert len(result["appeal_paragraphs"]) == 1
+                export = await c.get(f"/api/analyses/{report['id']}/appeal/download")
+                assert export.status_code == 200 and "INCOMPLETE" in export.text
+                assert result["verification_notes"][0] in export.text
+            cached = await c.post(path)
+            assert cached.json()["id"] == report["id"] and len(reviews) == 3
+        else:
+            assert response.status_code == 503 and response.json()["code"] == "unverified_evidence"
+            async with app.state.db.sessions() as session:
+                assert await session.scalar(select(Analysis)) is None
+
+
 def test_vision_requires_transcription_field_but_allows_explicit_illegibility():
     with pytest.raises(ValidationError):
         VisionDocumentExtraction(document_type="UNKNOWN", confidence=0, warnings=["Unreadable"])

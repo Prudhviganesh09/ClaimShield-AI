@@ -1,0 +1,10 @@
+SYNTHETIC LOCAL TEST ONLY - NOT A REAL DENIAL LETTER
+Denial letter dated: 1 October 2026
+Claim number: LOCAL-TEST-001
+Policy number: TEST-POLICY-001
+Insurer: Fictional Test Insurer
+Patient: Test Patient Alpha
+Claimed amount: INR 1,000
+Service date: 25 September 2026
+Denial reason: the original submission did not include an itemised invoice and clinician visit note.
+This is a documentation denial. No conclusion about the patient's diagnosis or final claim approval is stated.

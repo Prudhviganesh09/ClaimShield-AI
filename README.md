@@ -1,329 +1,400 @@
 # ClaimShield AI
 
-An evidence-first healthcare claim administration workspace. FastAPI handles authentication, documents,
-retrieval, and review history. Next.js provides the user interface. Supabase-hosted PostgreSQL stores claims,
-analyses, usage events, and pgvector embeddings. NVIDIA-hosted endpoints perform all model inference.
+ClaimShield AI is a workspace for reviewing healthcare insurance claims and preparing appeals from supporting documents. Upload a policy, denial letter, invoice, or medical record; the app helps you understand the evidence, ask questions, and record a human review.
 
-**The application uses NVIDIA-hosted inference. No GPU is required on the AWS EC2 instance.**
+**The website runs locally or on one CPU-only server. Supabase PostgreSQL stores the records, and NVIDIA-hosted APIs perform AI inference. A GPU is not required.**
 
-## Architecture
+For example, a denial may say an invoice was missing. After you upload the invoice, ClaimShield can identify how it addresses the denial and draft an appeal with supporting quotations. The draft still needs a person to verify it.
 
-```mermaid
-flowchart TD
-    User[User] --> Internet[Internet / HTTPS]
-    Internet --> TLS[TLS termination: AWS ALB or Nginx]
-    subgraph EC2[AWS EC2 · CPU only · Docker Compose]
-        TLS --> Nginx[claimshield-nginx]
-        Nginx --> Next[claimshield-frontend · Next.js]
-        Nginx --> API[claimshield-backend · FastAPI]
-        API --> OCR[PyMuPDF + local Tesseract OCR]
-        API --> Provider[NvidiaProvider · pooled async httpx]
-    end
-    API -->|TLS / SQLAlchemy + asyncpg| DB[Supabase PostgreSQL + pgvector]
-    Provider -->|HTTPS| NVIDIA[integrate.api.nvidia.com]
-    NVIDIA --> Models[Hosted Nemotron reasoning / fast / vision / embeddings]
-```
+## Contents
 
-The default Compose deployment has **three application containers**, using Supabase as the external database.
-It does not run a local PostgreSQL container, model server, GPU runtime, or model weights. Redis is not required;
-bounded caches and single-flight request deduplication run in the backend process. Use one backend worker.
+- [What the four tabs mean](#what-the-four-tabs-mean)
+- [Run locally with Docker](#run-locally-with-docker)
+- [Use the application](#use-the-application)
+- [Test the complete local workflow](#test-the-complete-local-workflow)
+- [Configure Supabase PostgreSQL](#configure-supabase-postgresql)
+- [Configure NVIDIA AI](#configure-nvidia-ai)
+- [Environment settings](#environment-settings)
+- [Storage and security](#storage-and-security)
+- [Deploy on one AWS EC2 instance](#deploy-on-one-aws-ec2-instance)
+- [Troubleshooting](#troubleshooting)
+- [Develop without Docker](#develop-without-docker)
+- [Verification and project structure](#verification-and-project-structure)
 
-```mermaid
-flowchart TD
-    Upload[Uploaded original · saved before inference] --> Text[PyMuPDF / UTF-8 text extraction]
-    Text --> Quality{Usable text?}
-    Quality -->|Yes| Clean[Clean text + local field heuristics]
-    Quality -->|No| OCR[Tesseract OCR]
-    OCR --> Confidence{OCR quality sufficient?}
-    Confidence -->|Yes| Clean
-    Confidence -->|No| Vision[NVIDIA structured vision extraction]
-    Vision --> Clean
-    Clean --> Chunk[Paragraph / sentence-aware chunks]
-    Chunk --> Passage[NVIDIA embedding · input_type passage · batches]
-    Passage --> Vector[Supabase pgvector + model/dimension metadata]
-    Question[User question] --> Query[NVIDIA embedding · input_type query]
-    Query --> Search[Hybrid vector + PostgreSQL full-text search]
-    Vector --> Search
-    Search --> Rank[Heuristic rerank + deduplicate + context budget]
-    Rank --> Reason[NVIDIA routed reasoning · Pydantic JSON validation]
-    Reason --> Verify[Exact citation verification + semantic evidence review]
-    Verify --> Answer[Grounded response + deterministic risk/confidence]
-    Answer --> Human[Human review / appeal draft]
-```
+## What the four tabs mean
 
-## First start
-
-This workspace's ignored `.env` is configured for localhost with the supplied Supabase API keys and existing
-NVIDIA key. Supabase PostgreSQL authentication, the initial migration, pgvector, and database access checks have
-passed using a verified TLS session-pooler connection. Administrator credentials are saved in `.env`. See
-[the verification record](docs/VERIFICATION.md) for the checks and remaining deployment validation.
-
-Prerequisites: Docker Engine with Compose v2, a Supabase project, and an NVIDIA API key. For source development,
-use Python 3.12, Node 24, and Tesseract. Docker installs Tesseract in the backend image.
-
-1. Create `.env` from `.env.example` and replace `JWT_SECRET` with at least 32 random characters. You can run
-   `python scripts/setup_env.py` to create it with a generated secret. The script refuses to overwrite an existing file.
-2. Configure Supabase as described below, and put its complete connection URI in `DATABASE_URL`.
-3. Set `NVIDIA_API_KEY` and confirm model IDs in NVIDIA's catalog.
-4. For an administrator, set **both** `ADMIN_EMAIL` and a strong `ADMIN_PASSWORD` (12+ characters). A new admin is
-   created at startup only when that email does not exist. Existing accounts are never silently promoted.
-5. For local HTTP testing, set `APP_ENV=development`, `COOKIE_SECURE=false`, and
-   `ALLOWED_ORIGINS=["http://localhost"]`. Keep `DATABASE_SSL=true` for Supabase.
-6. Run:
-
-   ```sh
-   docker compose up --build -d
-   docker compose ps
-   docker compose logs --tail=100 backend
-   ```
-
-7. Open [ClaimShield on localhost](http://localhost). Create a reviewer account or sign in as your configured admin.
-   Start a claim and upload PDF, PNG, JPEG, or UTF-8 `.txt` documents. Indexing runs in the background with visible
-   processing status. Failed documents offer **Retry**. **Reindex** updates embeddings after changing the model.
-
-With `DEMO_MODE=true`, **Try synthetic sample** creates three explicitly fictional documents. They pass through
-the same real extraction and NVIDIA embedding pipeline as uploads; the application does not fabricate AI results.
-Disable demo mode for your production workspace. Never use synthetic outputs as real claim evidence.
-
-## Supabase PostgreSQL setup
-
-1. Create or select your Supabase project and open its **Connect** dialog.
-2. Copy the **direct database connection** if your EC2 host supports IPv6, or use the **session pooler** on port
-   `5432` for IPv4. Change the URI scheme to `postgresql+asyncpg://`.
-3. URL-encode special characters in the database password. Copy the hostname/user from your own project's dialog;
-   the example hostname is a placeholder.
-
-   ```dotenv
-   DATABASE_URL=postgresql+asyncpg://postgres.PROJECT_REF:URL_ENCODED_PASSWORD@YOUR_SESSION_POOLER_HOST:5432/postgres
-   DATABASE_SSL=true
-   DATABASE_POOL_SIZE=3
-   ```
-
-4. Use a database role allowed to create the ClaimShield tables and enable the `vector` extension. The default
-   Supabase `postgres` connection can run the initial migration. A restricted runtime role must own the application
-   tables or have appropriate table privileges and RLS access. Do not expose database credentials to browsers.
-5. Backend startup runs `alembic upgrade head`. The initial migration creates only `cs_*` tables plus
-   `alembic_version`, a full-text GIN index, and the pgvector extension in `extensions`. It enables RLS on `cs_*`
-   tables and revokes Supabase `anon` and `authenticated` access. ClaimShield authenticates users in FastAPI and
-   enforces owner/admin checks on every claim/document endpoint. It does not use Supabase's public REST API or Auth.
-
-**Use direct or session mode, not the transaction pooler on port `6543`.** SQLAlchemy's asyncpg dialect uses
-prepared statements. This deployment intentionally rejects transaction-mode URLs. TLS validates certificates;
-it is not disabled to work around connection errors.
-
-The public Supabase Root 2021 CA is bundled under `backend/certs` and added to system trust for Supabase database
-hostnames. Hostname verification remains enabled. `DATABASE_SSL_CA_FILE` can override the CA file if needed.
-The optional URI parameter `sslmode=require` is normalized to the application's verified TLS configuration.
-
-Vector columns store variable dimensions with explicit `embedding_model` and `embedding_dimension` metadata.
-Retrieval filters both before distance comparisons. Model changes require reindexing each affected document.
-An exact vector scan is used per claim (bounded to 50 documents), combined with indexed PostgreSQL full-text
-search. There is no HNSW vector index in this MVP; this avoids assuming index dimension compatibility for 2048-D
-vectors and keeps the initial deployment simple. Profile actual workloads before adding an index.
-
-References: [Supabase connection modes](https://supabase.com/docs/guides/database/connecting-to-postgres),
-[Supabase pgvector](https://supabase.com/docs/guides/database/extensions/pgvector).
-
-## NVIDIA AI Setup
-
-1. Create/sign in to an [NVIDIA developer account](https://developer.nvidia.com/).
-2. Open [NVIDIA's API/model catalog](https://build.nvidia.com/).
-3. Select available hosted/free endpoints, and verify your account has access to each configured model.
-4. Generate an [NVIDIA API key](https://build.nvidia.com/settings/api-keys).
-5. Add `NVIDIA_API_KEY=...` to the backend `.env`.
-6. Configure model IDs, embedding dimension, and any supported model-specific parameters.
-7. Start ClaimShield; an admin can run the **Check provider** action in **Provider & usage**.
-
-**Hosted endpoint availability, free quotas, and rate limits are controlled by NVIDIA and may change. Model IDs
-are therefore configurable.** A successful `/models` health request verifies reachability/authentication, not access
-to every individual model or remaining quota. Check the catalog and run an actual document/analysis workflow.
-
-| Task | Environment configuration | Default model |
+| Tab | Purpose | Example |
 | --- | --- | --- |
-| Classification, metadata, simple questions, summaries | `NVIDIA_FAST_MODEL` | `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` |
-| Policy, denial, contradictions, synthesis, appeals, orchestration | `NVIDIA_REASONING_MODEL` | `nvidia/nemotron-3-super-120b-a12b` |
-| Poor OCR / image understanding | `NVIDIA_VISION_MODEL` | `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` |
-| Passage/query embeddings | `NVIDIA_EMBEDDING_MODEL` | `nvidia/nemotron-3-embed-1b` |
-| Optional safety classification | `NVIDIA_SAFETY_MODEL` | Configured by operator, disabled by default |
+| **Analysis** | Reviews indexed documents for supported findings, missing information, inconsistencies, and suggested next steps. | Identify the reason for denial and the evidence relevant to it. |
+| **Ask evidence** | Answers a specific question using this claim's uploaded documents. Answers include source citations. | "Does this policy cover outpatient consultations?" |
+| **Appeal draft** | Prepares proposed appeal paragraphs with evidence and quotations, available as a text download. | Explain how a newly supplied invoice addresses a documentation denial. |
+| **Human review** | Saves a person's review notes and workflow status. | "Invoice checked; request a clearer clinician note." |
 
-`NvidiaModelRouter` centralizes selection. `NvidiaProvider` uses `httpx.AsyncClient` connection pooling and low
-temperature. Model parameters can be supplied as a JSON mapping in `NVIDIA_MODEL_PARAMETERS`, for example:
+A useful sequence is **upload documents → Analysis → Ask evidence → Appeal draft → Human review**. You can return to any tab as evidence changes.
+
+The app does not approve or deny insurance claims, submit appeals to insurers, or guarantee an appeal's success. The evidence-quality score measures the available evidence, not the probability of approval. Check every conclusion and quotation against the original documents before using a result.
+
+## Run locally with Docker
+
+### 1. Install and start Docker
+
+On Windows, install [Docker Desktop](https://docs.docker.com/desktop/setup/install/windows-install/) with its WSL 2 Linux-container backend. Start Docker Desktop and wait until the engine is running. Python virtual-environment activation is not required for the Docker setup.
+
+In a new PowerShell window, check:
+
+```powershell
+docker version
+docker compose version
+```
+
+`docker version` must show both **Client** and **Server**. If only Client appears, fix Docker/WSL before starting the app. On Linux, use Docker Engine with the Compose plugin.
+
+### 2. Configure the root .env
+
+From this Windows workspace:
+
+```powershell
+cd "C:\Users\jayak\Music\ClaimShield AI"
+```
+
+If `.env` already exists, retain its configured credentials. For a fresh checkout only, copy the template:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Edit `.env` to supply the real Supabase SQL connection URI, NVIDIA key, and JWT secret. For local HTTP, use:
 
 ```dotenv
-NVIDIA_MODEL_PARAMETERS={"nvidia/nemotron-3-super-120b-a12b":{"reasoning_effort":"low","reasoning_budget":4096},"nvidia/nemotron-3-nano-omni-30b-a3b-reasoning":{"reasoning_budget":512}}
+APP_ENV=development
+AI_PROVIDER=nvidia
+NVIDIA_API_KEY=YOUR_NVIDIA_API_KEY
+DATABASE_URL=postgresql+asyncpg://postgres.PROJECT_REF:URL_ENCODED_PASSWORD@YOUR_SESSION_POOLER_HOST:5432/postgres
+DATABASE_SSL=true
+DATABASE_POOL_SIZE=1
+JWT_SECRET=REPLACE_WITH_A_RANDOM_SECRET_OF_AT_LEAST_32_CHARACTERS
+ADMIN_EMAIL=admin@example.com
+ADMIN_PASSWORD=REPLACE_WITH_A_STRONG_PASSWORD_OF_AT_LEAST_12_CHARACTERS
+COOKIE_SECURE=false
+ALLOWED_ORIGINS=["http://localhost"]
+DEMO_MODE=true
+LOW_MEMORY_MODE=true
+PUBLIC_PORT=80
 ```
 
-The example environment uses low-effort Super reasoning with a 4096-token reasoning budget and an 8192-token
-total output cap. Live testing showed that an excessively small reasoning budget could leave reasoning prose
-in the answer field and fail strict JSON validation. Only use
-parameters supported by the selected endpoint. They are not sent to unrelated models. Output tokens
-include the model's reasoning allocation; if output is truncated, the provider rejects it and reports the token
-limit. Adjust `MAX_OUTPUT_TOKENS` and supported reasoning parameters as appropriate for your model/account.
+Replace every placeholder before starting. Keep the NVIDIA model settings from `.env.example`. To generate a random JWT secret using Docker:
 
-The generic structured path supplies a JSON schema in the system prompt, parses JSON, validates with Pydantic,
-and permits exactly one schema repair request. It does not require provider-native JSON-schema support. Vision
-uses base64 image content parts. The provider interface supports future streaming; current user-facing responses
-are buffered so evidence checks complete before any conclusions are displayed.
+```powershell
+docker run --rm python:3.12-slim python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
 
-`NVIDIA_REASONING_FALLBACK_MODEL` and `NVIDIA_FAST_FALLBACK_MODEL` are optional. Transient network failures,
-timeouts, `429`, `5xx`, and unavailable-model responses use bounded exponential backoff. The configured fallback
-is used only after retries are exhausted, with model-specific parameters. Authentication and invalid payload
-errors do not trigger failover. The actual model and fallback status appear in usage logs and saved reports.
-Pending (`202`) responses are retried within the bounded policy; no arbitrary redirect or polling URL is followed.
+Paste the generated value into `JWT_SECRET`. Keep `.env` private and excluded from Git.
 
-The default embedding endpoint accepts **passage** for indexing and **query** for questions. The default model
-uses 2048-D output; set `NVIDIA_EMBEDDING_DIMENSION` if choosing another model. Inputs are batched (16 by default),
-bounded conservatively below the endpoint's input limit, and vectors are checked for dimension, finiteness,
-nonzero values, response index ordering, and count.
+`ADMIN_EMAIL` and `ADMIN_PASSWORD` must both be set or both be empty. On first startup, the app creates an administrator only if that email does not already exist. Changing `ADMIN_PASSWORD` later does not reset an existing account, and an existing reviewer account is not silently promoted.
 
-API references: [reasoning](https://docs.api.nvidia.com/nim/reference/nvidia-nemotron-3-super-120b-a12b-infer),
-[multimodal](https://docs.api.nvidia.com/nim/reference/nvidia-nemotron-3-nano-omni-30b-a3b-reasoning-infer),
-[embeddings](https://docs.api.nvidia.com/nim/reference/nvidia-nemotron-3-embed-1b-infer).
+### 3. Build and start
 
-## Evidence, caching, and failure behavior
+Run these commands one at a time; stop and inspect the error if a command fails:
 
-- Originals are written to a persistent Docker volume and database records are committed before inference.
-  Provider failures leave claims, originals, previous analyses, login, and human review available.
-- Text PDFs use PyMuPDF. Scanned pages/images attempt local Tesseract first. Only poor OCR triggers remote vision.
-  AI transcriptions carry explicit warnings and reduced confidence. Corrupt, encrypted, oversized, or empty files
-  fail safely. The configurable defaults are 20 MB/file and 50 pages/PDF, plus 50 documents/claim.
-- Document checksums deduplicate uploads within a claim. Persisted chunks/embeddings survive restart, and reindexing
-  preserves chunk IDs so historical citations stay resolvable. Interrupted jobs become retryable; committed but
-  unstarted uploads are scheduled at startup. Failed jobs do not consume quota in a retry loop.
-- Response/embedding/query caches are bounded, in-memory, tenant-scoped TTL caches. Concurrent equivalent requests
-  share one task. Embedding keys include input mode, model, dimension, and tenant. Errors are never cached.
-  Analysis caching persists in PostgreSQL, keyed by claim evidence revision, question/task, and model configuration.
-- Retrieval selects candidate passages, reranks vector/full-text/keyword/document-priority scores, removes duplicate
-  text, and fits a token budget. Entire document collections are never sent as a reasoning prompt.
-- Every finding, recommendation, and appeal paragraph requires existing chunk IDs and exact source quotations.
-  A separate semantic review checks conclusions against their quotations and source context. One bounded
-  regeneration can correct a rejected draft, followed by the same exact and semantic checks. A still-rejected
-  response is never saved or cached, so a manual retry makes a fresh inference request. These checks reduce unsupported outputs but do not
-  replace a human reviewing source documents, especially OCR/vision transcriptions.
-- Missing-document/risk rules and the weighted evidence-confidence score are deterministic Python. The confidence
-  score describes evidence quality, not approval probability. Workflow statuses never approve or deny a claim.
-- Optional safety classification is enabled by `ENABLE_NVIDIA_SAFETY=true` and a configured safety model. Its
-  outage does not block the application. Application scope rules, constrained prompts, typed schemas, citation
-  verification, semantic review, and human review remain active.
+```powershell
+docker compose config --quiet
+docker compose up --build -d
+docker compose ps
+curl.exe --fail http://localhost/api/health
+```
 
-## Admin usage
+The first build downloads images and dependencies and can take several minutes. Wait for it to finish. Expect three running services, with `backend` marked **healthy**, and this health response:
 
-`AI_USAGE_MODE=quota` is the default; `cost` mode is also accepted. The dashboard shows NVIDIA requests, requests
-today/month, token estimates, rate-limit events, failures, per-model distribution, and average latency. Counts
-are **HTTP inference attempts**, including retries and structured-output repair/verification calls. Reporting
-periods use UTC. Cached results make no inference calls and add no usage events. Dollar cost remains unavailable
-until verified pricing data is supplied; no costs are fabricated.
+```json
+{"status":"ok","database":true,"ai_provider":"nvidia"}
+```
 
-Every inference attempt records provider, actual model, task, timestamp, latency, token counts/estimates,
-HTTP status, success, retry count, fallback use, claim/owner IDs, and request ID. Sensitive prompts and document
-contents are not stored in usage logs. Evidence and reports remain in their authorized application tables.
+Backend container startup runs the database migrations automatically. The health endpoint verifies application/database readiness; it does not verify access to every NVIDIA model.
 
-Key endpoints (session cookie required except register/login/health):
+### 4. Open the website
 
-| Method | Endpoint | Purpose |
+Open **[http://localhost](http://localhost)** in Chrome or Edge. Sign in using the administrator credentials in `.env`, or choose **Create an account** for a reviewer account. Passwords require at least 12 characters.
+
+| Running mode | Browser URL |
+| --- | --- |
+| Docker Compose with the default gateway port | `http://localhost` |
+| Source development with Next.js | `http://localhost:3000` |
+| Production | Your configured HTTPS domain |
+
+If port 80 is already occupied, set `PUBLIC_PORT=8080` and `ALLOWED_ORIGINS=["http://localhost:8080"]`, run `docker compose up -d`, and open `http://localhost:8080`.
+
+### Everyday commands
+
+```powershell
+# Start after Docker Desktop is running.
+docker compose up -d
+
+# Inspect service status and recent logs.
+docker compose ps
+docker compose logs --tail=100 backend frontend nginx
+
+# Stop services while retaining containers and uploaded files.
+docker compose stop
+
+# Rebuild after application code changes.
+docker compose up --build -d
+```
+
+**Do not run `docker compose down -v` unless you intend to delete the uploaded originals in the Docker volume.**
+
+## Use the application
+
+1. **Overview / All claims:** browse claims or click **New claim**. Enter a title and any available claim number, insurer, and amount. Amounts use the document's currency; the app does not convert currencies.
+2. **Upload evidence:** open a claim and choose PDF, PNG, JPEG, or UTF-8 `.txt` files. Wait until processing finishes and the document status becomes `ready`.
+3. **Analyze:** open **Analysis** and click **Analyze claim**. Read the supported findings, recommendations, missing-information notices, and evidence-quality explanation. Expand citations and use **Download source** to inspect originals.
+4. **Ask:** open **Ask evidence**, enter a question, and click the send button. For example: "What documents support the reason for denial?"
+5. **Draft:** open **Appeal draft** and click **Draft appeal**. Verify the paragraphs and citations, then use **Download appeal draft**. Edit the downloaded draft outside the app before sending it through your own process.
+6. **Review:** open **Human review**, choose a status, enter notes, and click **Save review**. The statuses are `collecting_evidence`, `ready_for_review`, `in_review`, and `reviewed`; they are administrative workflow labels.
+
+Default upload limits are **20 MB/file**, **50 pages/PDF**, and **50 documents/claim**. Text PDFs are extracted locally; scanned pages/images attempt Tesseract OCR, then NVIDIA vision when local extraction is insufficient. An AI transcription can contain mistakes and needs source review.
+
+A failed document offers **Retry**. A ready document offers **Reindex**, useful after an embedding-model change. If evidence changes, the app warns when a saved report is outdated; run a new analysis to include the new evidence. Previous reports remain available in history.
+
+## Test the complete local workflow
+
+Use fictional documents for testing. Four portable examples are included in [docs/examples](docs/examples):
+
+| File | What it contains |
+| --- | --- |
+| [01-policy.txt](docs/examples/01-policy.txt) | Outpatient coverage, required documents, and an appeal deadline rule. |
+| [02-denial.txt](docs/examples/02-denial.txt) | A fictional denial for a missing invoice and clinician visit note. |
+| [03-invoice.txt](docs/examples/03-invoice.txt) | An itemised invoice and payment receipt. |
+| [04-clinician-note.txt](docs/examples/04-clinician-note.txt) | A fictional outpatient visit record. |
+
+In this workspace, find them in `C:\Users\jayak\Music\ClaimShield AI\docs\examples`.
+
+1. Confirm the health response shown above.
+2. Sign in as admin. Open **Provider & usage → Check provider**. Expect the configured-key and reachable-endpoint indicators to show `ready`.
+3. Create a claim titled **Local Test — Fictional**, claim number `LOCAL-TEST-001`, insurer **Fictional Test Insurer**, amount `1000`.
+4. Upload all four example files. Wait for every document to show `ready`. Use **Original** to download one and compare it with the uploaded file.
+5. Run **Analyze claim**. Check the denial reason and supporting citations. Conclusions should distinguish the original missing-document denial from documents now available for review; they must not promise insurer approval.
+6. In **Ask evidence**, ask: **"What caused the denial, and which uploaded documents address that reason?"** Verify quotations against the originals.
+7. Run **Draft appeal**, download it, and confirm it contains evidence quotations and a human-review notice. These files do not establish when an appeal was actually submitted; a draft should not invent that date.
+8. Save a human-review note such as **Local verification completed**. Refresh the page and confirm the note remains.
+9. After processing and AI requests finish, run `docker compose restart backend`. Wait for a healthy backend, refresh, and confirm records, reports, review notes, and original downloads remain accessible.
+10. In PowerShell, run `curl.exe -i http://localhost/api/claims` without a session cookie. Expect **401 Unauthorized**.
+
+With `DEMO_MODE=true`, a user with no claims can also choose **Try synthetic sample** from the empty claims view. It creates fictional evidence and uses real NVIDIA inference. The button is not shown once that user's claims list is populated.
+
+To test scanned-document OCR, also upload a legible fictional PNG/JPEG or scanned PDF. Check the extracted evidence against the image. The four text examples above test text ingestion rather than OCR. AI requests consume NVIDIA account quota and may take a few minutes.
+
+## Configure Supabase PostgreSQL
+
+ClaimShield connects to Supabase with SQLAlchemy and `asyncpg`; it authenticates users in FastAPI rather than through Supabase Auth.
+
+1. Open your Supabase project and click **Connect**.
+2. For an IPv4 connection, select **Session pooler**, port **5432**. Copy its exact username and hostname.
+3. Substitute your database password and percent-encode reserved characters in that password, such as `@` as `%40`.
+4. Change the URI prefix from `postgresql://` to `postgresql+asyncpg://` and save it as `DATABASE_URL`.
+5. Keep `DATABASE_SSL=true`. A direct connection on port 5432 is also supported when the host's network can reach it.
+
+Example structure only:
+
+```dotenv
+DATABASE_URL=postgresql+asyncpg://postgres.PROJECT_REF:URL_ENCODED_PASSWORD@YOUR_SESSION_POOLER_HOST:5432/postgres
+DATABASE_SSL=true
+DATABASE_POOL_SIZE=1
+```
+
+**Do not use transaction-pooler port 6543:** this application uses prepared statements and rejects that connection mode. Copy the pooler host from your project's Connect dialog; do not guess it from the region. See [Supabase's connection guide](https://supabase.com/docs/guides/database/connecting-to-postgres).
+
+Supabase anon/service-role keys and the project URL **do not replace the database URI or database password**. The optional `SUPABASE_*` settings support Data API diagnostics; normal application storage uses the SQL connection.
+
+Initial migration requires a database role allowed to create the app's tables and enable `vector`. It creates `cs_*` tables plus `alembic_version`, enables RLS on the application tables, and revokes public API access for Supabase's `anon`/`authenticated` roles. A restricted runtime role needs the appropriate application-table and RLS permissions.
+
+Database TLS verifies certificates and hostnames. The public Supabase Root 2021 CA is bundled in `backend/certs`; `DATABASE_SSL_CA_FILE` can supply an alternative trusted CA. Do not disable TLS to work around an error.
+
+## Configure NVIDIA AI
+
+1. Sign in to [NVIDIA's model catalog](https://build.nvidia.com/).
+2. Obtain an [NVIDIA API key](https://build.nvidia.com/settings/api-keys) and place it in the root `.env` as `NVIDIA_API_KEY`.
+3. Retain or configure model IDs supported by your account.
+4. Recreate the backend after configuration changes with `docker compose up -d`.
+5. Run the admin provider check and an actual upload/analysis workflow. Reachability alone does not prove individual model access or available quota.
+
+The application's configured defaults are:
+
+| Task | Environment variable | Default model ID |
 | --- | --- | --- |
-| POST | `/api/auth/register`, `/api/auth/login`, `/api/auth/logout` | Session lifecycle |
-| GET | `/api/auth/me` | Current user |
-| GET/POST | `/api/claims` | Browse/create claims |
-| GET | `/api/claims/{id}` | Documents + report history |
-| POST | `/api/claims/{id}/documents` | Save upload, enqueue extraction/indexing |
-| GET | `/api/documents/{id}/download` | Authorized original download |
-| GET | `/api/analyses/{id}/appeal/download` | Authorized appeal draft with source quotations |
-| POST | `/api/documents/{id}/retry` | Retry/reindex |
-| POST | `/api/claims/{id}/analyze`, `/appeal`, `/chat` | Evidence-grounded workflows |
-| POST | `/api/claims/{id}/review` | Human review notes/status |
-| GET | `/api/admin/providers/nvidia/health` | Lightweight authenticated provider check |
-| GET | `/api/admin/usage` | Admin usage aggregates |
-| GET | `/api/health` | Database/application readiness, independent of NVIDIA |
+| Fast extraction/classification and simple questions | `NVIDIA_FAST_MODEL` | `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` |
+| Policy/denial reasoning and appeals | `NVIDIA_REASONING_MODEL` | `nvidia/nemotron-3-super-120b-a12b` |
+| Image extraction when OCR is insufficient | `NVIDIA_VISION_MODEL` | `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` |
+| Document/query embeddings | `NVIDIA_EMBEDDING_MODEL` | `nvidia/nemotron-3-embed-1b` |
 
-## Production EC2 deployment
+These IDs describe the application configuration, not guaranteed endpoint availability or permanent free access. NVIDIA controls availability, quota, and rate limits. The default embedding dimension is **2048**. Changing embedding model/dimension requires reindexing affected documents.
 
-For this workspace's local run commands and a single low-cost EC2 deployment, follow
-[the step-by-step EC2 guide](docs/EC2_DEPLOYMENT.md). It includes source transfer,
-production environment settings, HTTPS, automatic certificate renewal, and verification.
+All inference uses `https://integrate.api.nvidia.com/v1`. Model-specific reasoning settings, retry/fallback behavior, caching, and evidence verification are documented in [the implementation notes](docs/ARCHITECTURE.md).
 
-Use a CPU-only Linux instance with sufficient memory for Next.js, Python PDF/OCR processing, and the OS
-(2 GB is a practical starting point; build images elsewhere if build memory is constrained). Supabase hosts
-the database. Docker memory limits bound each container. OCR and inference concurrency are deliberately limited.
-No CUDA, GPU drivers, NVIDIA Container Toolkit, Transformers, NIM containers, or local model downloads are used.
+## Environment settings
 
-1. Configure `.env` with `APP_ENV=production`, `COOKIE_SECURE=true`, `DEMO_MODE=false`, strong secrets, Supabase TLS,
-   and `ALLOWED_ORIGINS=["https://YOUR_DOMAIN"]`.
-2. Restrict `.env` permissions on Linux: `chmod 600 .env`. Restrict SSH to your administration IP.
-3. Put the HTTP Nginx service behind a TLS-terminating AWS ALB/reverse proxy, or use the provided Nginx TLS override:
+[.env.example](.env.example) lists all settings. The most relevant ones are:
 
-   ```sh
-   # Provision your certificate/key first under deploy/certs (excluded from Git).
-   docker compose -f compose.yaml -f compose.tls.yaml up --build -d
-   ```
+| Setting | Meaning |
+| --- | --- |
+| `APP_ENV` | `development` for local HTTP; `production` for an HTTPS deployment. |
+| `DATABASE_URL`, `DATABASE_SSL` | Supabase PostgreSQL URI and verified TLS. |
+| `DATABASE_POOL_SIZE` | Connection-pool size; `1` is a conservative setting for light use on a small server. |
+| `NVIDIA_API_KEY`, `NVIDIA_*_MODEL` | Backend-only credentials and model routing. |
+| `JWT_SECRET` | Random session-signing secret; changing it invalidates existing sessions on that deployment. |
+| `ADMIN_EMAIL`, `ADMIN_PASSWORD` | Optional first-time administrator bootstrap. |
+| `COOKIE_SECURE` | `false` for local HTTP; `true` for production HTTPS. |
+| `ALLOWED_ORIGINS` | JSON array of allowed browser origins, including scheme and any nondefault port. |
+| `DEMO_MODE` | Enables the fictional sample option; disable in production. |
+| `LOW_MEMORY_MODE` | Uses smaller bounded in-process caches. |
+| `PUBLIC_PORT` | Host HTTP gateway port; defaults to `80`. |
+| `UPLOAD_DIR` | Local source-mode upload directory; Compose overrides it to `/data/uploads`. |
+| `MAX_UPLOAD_MB`, `MAX_DOCUMENT_PAGES` | Document-size/page limits. |
+| `MAX_CONTEXT_TOKENS`, `MAX_OUTPUT_TOKENS` | Input-context/output budgets; output includes model reasoning allocation. |
+| `AI_USAGE_MODE` | `quota` by default; the dashboard also accepts `cost`, without inventing dollar costs. |
 
-4. Expose only your intended HTTP/HTTPS gateway. Backend and frontend ports are internal. No PostgreSQL port
-   is opened on EC2. Enable outbound HTTPS to NVIDIA and database TLS to Supabase.
-5. Verify readiness, administrator sign-in, a text/PDF upload, extraction status, real embeddings, analysis,
-   source download, review persistence, and provider health. The NVIDIA key is accessible only to FastAPI;
-   it is not injected into frontend builds or a `NEXT_PUBLIC_` variable.
-6. Back up the Docker `uploads` volume alongside Supabase database backups. A database-only backup cannot restore
-   original uploaded files. Use an encrypted backup destination and test restoring both together.
+A `.env` change normally requires `docker compose up -d` to recreate affected services. `docker compose restart` alone does not apply changed container environment variables. Use `docker compose config --quiet` for validation; unrestricted `docker compose config` can print resolved secrets.
 
-The TLS override expects `deploy/certs/fullchain.pem` and `deploy/certs/privkey.pem`. For ALB termination, use the
-base Compose file and restrict EC2 gateway access to the ALB security group. Do not expose production sign-in over
-plain HTTP while secure cookies are enabled. The application deliberately refuses insecure production cookie settings.
+## Storage and security
 
-## Source development and verification
+| Component | Data/responsibility |
+| --- | --- |
+| Supabase PostgreSQL + pgvector | Users, claims, extracted passages, embeddings, reports, reviews, and usage records. |
+| Persistent Docker `uploads` volume | Uploaded original files on the machine running Docker. |
+| NVIDIA-hosted APIs | Relevant document text, questions, and images supplied for inference tasks. |
+| FastAPI | Authentication, claim ownership/admin checks, processing, and evidence validation. |
+| Nginx / Next.js | Gateway and browser interface; application secrets stay on the backend. |
 
-Keep `.env` at the repository root. Backend commands below run from the root so configuration resolves consistently:
+NVIDIA inference requires sending task inputs to NVIDIA; the system is not an entirely offline application. Keep credentials out of frontend code and `NEXT_PUBLIC_*` variables. Download endpoints enforce authentication and claim access.
 
-```sh
+Back up **both** the original-file volume and the Supabase database. A fresh Docker volume does not contain originals uploaded in source development or on another machine. Moving records alone does not migrate those files or their stored paths.
+
+Citation checks and a separate semantic review reject unsupported outputs, but they do not guarantee that every AI conclusion or OCR transcription is correct. Review originals. If inference fails, previously saved evidence/reports and manual review remain available.
+
+## Deploy on one AWS EC2 instance
+
+Follow [the complete EC2 deployment guide](docs/EC2_DEPLOYMENT.md) for source transfer, Docker installation, swap, production configuration, HTTPS certificates, renewal, and verification.
+
+The deployment uses **three containers on one CPU-only EC2 instance**: Nginx, Next.js, and FastAPI. Supabase and NVIDIA remain external services. A 2 GiB instance is a practical starting point for light use; the configured container memory limits total 1,088 MiB before host overhead. Monitor actual load rather than treating idle measurements as a capacity guarantee.
+
+For production, configure:
+
+```dotenv
+APP_ENV=production
+COOKIE_SECURE=true
+ALLOWED_ORIGINS=["https://YOUR_DOMAIN"]
+DATABASE_SSL=true
+DEMO_MODE=false
+```
+
+Supply strong secrets and valid certificates at `deploy/certs/fullchain.pem` and `deploy/certs/privkey.pem`, then use both Compose files:
+
+```bash
+sudo docker compose -f compose.yaml -f compose.tls.yaml up -d
+```
+
+Complete the guide's certificate renewal setup. Expose the HTTPS gateway and restrict SSH; backend/frontend ports remain internal. Use one backend worker. Pricing and trial eligibility must be checked before launching. EC2/ARM64 runtime and production HTTPS are not yet verified for this workspace.
+
+## Troubleshooting
+
+| Symptom | What to check/do |
+| --- | --- |
+| `docker` is not recognized | Install Docker Desktop and open a new terminal so PATH updates apply. |
+| Missing `dockerDesktopLinuxEngine` pipe or only Docker Client appears | Start Docker Desktop; wait for its Linux engine. Check WSL errors if startup fails. |
+| `wsl --version` reports a missing path | Repair/update WSL using Microsoft's [installation instructions](https://learn.microsoft.com/en-us/windows/wsl/install#offline-install), restart Windows if required, then retry Docker. |
+| WSL repair script cannot find its installer | `scripts/repair_wsl.ps1` is a workspace helper for a separately downloaded, verified MSI under `data/setup`; that installer is not part of the source archive. Use the Microsoft installer instructions instead on a fresh checkout. |
+| Browser cannot reach localhost | Check `docker compose ps`, gateway port, and logs. Compose uses port 80 by default, not port 3000. |
+| Backend is unhealthy or readiness returns 503 | Check the complete Supabase URI, encoded password, session-pooler host/port, project availability, TLS, and migration permissions. |
+| Login succeeds but does not remain signed in over HTTP | For local testing, use `APP_ENV=development` and `COOKIE_SECURE=false`. Production secure cookies require HTTPS. |
+| Administrator password changes in .env have no effect | Bootstrap settings do not reset an existing user's password. Use that account's existing credentials. |
+| Provider check fails or a document shows `needs_retry` | Check NVIDIA key/model access, quota, network, and logs. Use **Retry** after resolving the cause. |
+| Inference takes time | Wait for document indexing or evidence verification; the UI displays progress. Avoid duplicate clicks. |
+| Semantic evidence check rejects a draft | The app regenerates once. If specific conclusions remain unsupported, it can omit them and independently verify the remaining statements. A passing subset is labelled incomplete in the page and appeal download; review sources and supply missing evidence. If nothing usable verifies, nothing is saved. |
+| AI response is rejected for another reason | Review the error, source evidence, NVIDIA availability, and model configuration. Strict citation/schema checks can reject output; a saved successful result is not guaranteed for every input. |
+| Original download is missing after moving environments | Migrate original-file storage and stored paths as well as the database. |
+| Environment edits seem ignored | Run `docker compose up -d` to recreate the affected service. |
+
+Logs for diagnosis:
+
+```powershell
+docker compose logs --tail=100 backend frontend nginx
+```
+
+Share relevant errors, keeping credentials, connection URIs, and private document contents out of public logs/issues.
+
+## Develop without Docker
+
+Use this path when modifying source code. Install **Python 3.12**, **Node.js 24**, and native **Tesseract OCR**. Keep `.env` at the repository root, set local upload storage to `UPLOAD_DIR=data/uploads`, and allow `http://localhost:3000` for the development frontend. Supabase remains the database.
+
+In PowerShell, from the project root:
+
+```powershell
+# Skip this first command if the project's .venv already exists.
 python -m venv .venv
-# Activate .venv (Windows: .venv\Scripts\Activate.ps1; Linux: source .venv/bin/activate)
-pip install -r backend/requirements-dev.txt
+.\.venv\Scripts\python.exe -m pip install -r backend/requirements-dev.txt
+.\.venv\Scripts\python.exe scripts/migrate.py
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000 --no-access-log
 ```
 
-Run migrations from the root with `scripts/migrate.py`:
+Leave the backend terminal running. In a second PowerShell terminal:
 
-```sh
-python scripts/migrate.py
-uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000 --no-access-log
-```
-
-Optional live checks from the root (the NVIDIA check consumes a small amount of account quota and uses only
-synthetic inputs):
-
-```sh
-python scripts/check_supabase_api.py
-python scripts/check_nvidia.py
-python scripts/check_workflow.py --isolated
-# Complete live Supabase + NVIDIA test; creates clearly labeled fictional accounts/claims/documents:
-python scripts/check_workflow.py --postgres
-```
-
-The Supabase API check is read-only and does not run migrations or verify a PostgreSQL connection.
-The workflow check uses real NVIDIA inference in either mode, consumes account quota, and saves its report under
-`data/verification/workflow-*`. `--isolated` uses a SQLite test fixture; `--postgres` uses your configured Supabase
-database. Fictional completions are saved locally for diagnosing failed checks, without keys or request headers.
-
-Set development origins to `["http://localhost:3000"]`, `APP_ENV=development`, `COOKIE_SECURE=false`, and a local
-`UPLOAD_DIR=data/uploads`. The database stays Supabase; only test fixtures use SQLite.
-
-```sh
-cd frontend
+```powershell
+cd "C:\Users\jayak\Music\ClaimShield AI\frontend"
 npm ci
 npm run dev
-# In another terminal, from repository root:
-python -m pytest backend/tests -q
-ruff check backend
-# In frontend:
+```
+
+Open **http://localhost:3000**. Docker already installs Tesseract in its backend image; installing it directly on Windows is only necessary for source-mode OCR. Do not run two backends using the same Supabase database/upload paths for concurrent processing.
+
+## Verification and project structure
+
+From the project root, using the development virtual environment:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest backend/tests -q
+.\.venv\Scripts\ruff.exe check backend scripts
+```
+
+From `frontend`:
+
+```powershell
 npm run typecheck
 npm run build
 ```
 
-Tests use HTTP transport fixtures and temporary SQLite databases to exercise endpoint payloads, retries/failover,
-JSON validation, embedding modes/caching, tenant isolation, originals surviving outages, evidence verification,
-model-change reindexing, and review persistence. Test doubles are confined to tests; production calls use native
-HTTPS requests to NVIDIA. PostgreSQL migration/retrieval SQL has a separate compilation check. Live Supabase
-migrations and NVIDIA inference require your configured credentials and are not proved by offline test passes.
+Optional live checks, from the root:
 
-Project map: `backend/app/ai` (provider/router/cache), `backend/app/services` (documents/retrieval/reasoning),
-`backend/migrations` (Supabase schema), `frontend/app` (workspace UI), `deploy` (gateway), `scripts` (setup/checks).
+```powershell
+.\.venv\Scripts\python.exe scripts/check_supabase_api.py
+.\.venv\Scripts\python.exe scripts/check_nvidia.py
+.\.venv\Scripts\python.exe scripts/check_workflow.py --isolated
+.\.venv\Scripts\python.exe scripts/check_workflow.py --postgres
+```
+
+The Supabase API check is read-only and does not prove SQL connectivity. NVIDIA/workflow checks consume real inference quota. `--isolated` uses a temporary SQLite test fixture, not the production database. `--postgres` uses the configured Supabase database and leaves clearly named fictional accounts/claims/documents. Reports are written under ignored `data/verification`; fictional AI outputs may be saved there for diagnosis without credentials or request headers. These scripts run on the host, not inside the production backend image.
+
+Recorded verification includes **64 automated tests**, TypeScript checks/build, live Supabase/NVIDIA workflows, and Linux AMD64 Docker startup, authentication, native OCR, and NVIDIA embedding inference. Read [the verification record](docs/VERIFICATION.md) for evidence and remaining limits; these results do not certify EC2 deployment or every future model response.
+
+```text
+backend/
+  app/                 FastAPI, authentication, models, AI provider, services
+  migrations/          Supabase PostgreSQL schema migrations
+  certs/               Public database trust certificate
+  tests/               Automated backend tests
+frontend/
+  app/                 Next.js workspace interface
+  lib/                 API client and shared UI types
+deploy/                Nginx HTTP/HTTPS configuration
+docs/
+  ARCHITECTURE.md      Provider, retrieval, caching, and API details
+  EC2_DEPLOYMENT.md    Single-instance AWS deployment steps
+  VERIFICATION.md     Recorded checks and limitations
+  examples/           Fictional documents for manual testing
+scripts/              Environment setup, migrations, diagnostics, live checks
+compose.yaml          Local HTTP / base production services
+compose.tls.yaml      Production HTTPS override
+.env.example          Configuration template with placeholders
+```
+
+For backend endpoints and detailed inference behavior, see [Architecture and implementation notes](docs/ARCHITECTURE.md).
 #   C l a i m S h i e l d - A I  
  

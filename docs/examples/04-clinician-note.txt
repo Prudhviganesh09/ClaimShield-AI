@@ -1,0 +1,9 @@
+SYNTHETIC LOCAL TEST ONLY - NOT A REAL MEDICAL RECORD
+Medical record / clinician visit note
+Claim number: LOCAL-TEST-001
+Patient: Test Patient Alpha
+Clinic: Fictional Test Clinic
+Visit date: 25 September 2026
+Encounter: outpatient consultation for mild knee discomfort.
+Treatment recorded: examination and advice on rest and follow-up if symptoms persist.
+This visit note confirms that the outpatient consultation occurred. It does not establish insurer approval.

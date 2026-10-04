@@ -1,0 +1,9 @@
+SYNTHETIC LOCAL TEST ONLY - NOT A REAL INSURANCE POLICY
+Policy number: TEST-POLICY-001
+Insurer: Fictional Test Insurer
+Patient: Test Patient Alpha
+Coverage period: 1 January 2026 through 31 December 2026.
+This policy covers outpatient consultations, subject to a limit of INR 2,000 per consultation.
+Required claim documents: an itemised invoice, payment receipt, and clinician visit note.
+Appeals must be received within 30 calendar days after the date on the denial letter.
+This document does not establish when an appeal was submitted or received.

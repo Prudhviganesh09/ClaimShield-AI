@@ -25,6 +25,8 @@ Do not suggest retroactive authorization, claim payability, or other remedies un
 explicitly supports them. A deadline absent from an excerpt does not establish that no deadline applies.
 Never assert that an appeal is timely unless its cited text explicitly establishes timeliness.
 State only what the supplied excerpts establish. Keep conclusions focused and concise.
+Use one conclusion per statement. A proposed submission or request for reconsideration is an inference,
+not proof that documents were submitted, coverage was established, or an appeal will succeed.
 Return only schema-valid JSON. Leave appeal_paragraphs empty unless drafting an appeal.
 Appeals are drafts requiring human review. Missing evidence must appear in missing_information.
 """
@@ -90,7 +92,7 @@ class AnalysisService:
     async def analyze(self, claim: Claim, owner_id: str, question: str, kind: str):
         guard_question(question)
         key = cache_key(owner_id, claim.id, claim.revision, question, kind,
-                        self.ai.configuration_fingerprint(), "evidence-v3")
+                        self.ai.configuration_fingerprint(), "evidence-v4")
         return await self.requests.get_or_create(key, lambda: self._analyze(claim, owner_id, question, kind, key))
 
     async def _analyze(self, claim, owner_id, question, kind, key):
@@ -122,9 +124,10 @@ class AnalysisService:
                 "evidence": [{"chunk_id": e.chunk_id, "document": e.document_name,
                               "page": e.page, "text": e.text} for e in evidence]})},
         ]
-        # Cache only a fully verified report below. Permit one bounded grounding correction;
-        # both attempts must pass exact citations and the independent semantic reviewer.
+        # Cache only verified conclusions. Permit one regeneration, then one independent
+        # review of a retained subset if the reviewer explicitly identifies rejected indexes.
         original_messages = messages
+        verification_notes = []
         for attempt in range(2):
             result = await self.ai.structured(task, messages, GroundedResponse, owner_id, claim.id, use_cache=False)
             value = result.value
@@ -132,8 +135,31 @@ class AnalysisService:
                 await self._verify_grounding(value, evidence, owner_id, claim.id)
                 break
             except AIError as exc:
-                if exc.code != "unverified_evidence" or attempt:
+                if exc.code != "unverified_evidence":
                     raise
+                if attempt:
+                    rejected = getattr(exc, "rejected_indexes", None)
+                    if not rejected:
+                        raise
+                    # Remove only explicitly rejected conclusions. The remaining subset must pass
+                    # another independent review; a previous verdict cannot certify the subset.
+                    offset = 0
+                    updates = {"insufficient_evidence": True}
+                    for field in ("findings", "recommendations", "appeal_paragraphs"):
+                        items = getattr(value, field)
+                        updates[field] = [item for i, item in enumerate(items) if offset + i not in rejected]
+                        offset += len(items)
+                    retained = value.model_copy(update=updates)
+                    if not (retained.findings or retained.recommendations or retained.appeal_paragraphs):
+                        raise
+                    if kind == "appeal" and not retained.appeal_paragraphs:
+                        raise
+                    await self._verify_grounding(retained, evidence, owner_id, claim.id)
+                    value = retained
+                    verification_notes = ["Some conclusions were omitted because their cited sources did not "
+                        "support them. The remaining statements passed another evidence check. This result is "
+                        "incomplete; review the original documents before using it."]
+                    break
                 feedback = getattr(exc, "grounding_feedback", exc.message)
                 # Keep the correction prompt bounded even for a large rejected response.
                 correction = json.loads(original_messages[1]["content"])
@@ -148,6 +174,7 @@ class AnalysisService:
         assessment = deterministic_assessment(documents, value, evidence)
         analysis = Analysis(claim_id=claim.id, kind=kind, question=question, cache_key=key,
             result={**value.model_dump(), "assessment": assessment,
+                    "verification_notes": verification_notes,
                     "sources": [asdict(e) for e in evidence], "requires_human_review": True,
                     "evidence_revision": claim.revision}, model=result.model, fallback_used=result.fallback_used)
         async with self.db.sessions() as session:
@@ -174,15 +201,32 @@ class AnalysisService:
                  "reasonable and stated as inference. A source context may establish a claim ID or document "
                  "identity omitted from a short quotation. Do not add information beyond that source context. Reject invented "
                  "requirements, dates, clinical facts, treatment advice or autonomous claim decisions. "
-                 "Return supported=false and zero-based unsupported_indexes when any conclusion is unsupported."},
-                {"role": "user", "content": json.dumps({"conclusions": [f.model_dump() for f in conclusions],
-                    "source_context": [{"chunk_id": e.chunk_id, "text": e.text} for e in evidence
+                 "Proposed actions or requests for reconsideration, labelled as inference, need a reasonable "
+                 "basis in the evidence; they do not assert that the action already occurred or will succeed. "
+                 "Evaluate each entire statement independently. Return supported=true only when every statement "
+                 "is supported, with empty unsupported_indexes and issues. Otherwise return supported=false, "
+                 "all zero-based unsupported_indexes, and issues giving each rejected index and a specific reason."},
+                {"role": "user", "content": json.dumps({"conclusions": [
+                    {"index": i, **f.model_dump()} for i, f in enumerate(conclusions)],
+                    "source_context": [{"chunk_id": e.chunk_id, "document": e.document_name,
+                                        "page": e.page, "text": e.text} for e in evidence
                         if e.chunk_id in {c.chunk_id for f in conclusions for c in f.citations}]})},
             ], EvidenceVerification, owner_id, claim_id, use_cache=False)
-            if not verification.value.supported or verification.value.unsupported_indexes:
+            if (not verification.value.supported or verification.value.unsupported_indexes
+                    or verification.value.issues):
+                verdict = verification.value
+                rejected = set(verdict.unsupported_indexes)
+                usable_indexes = (not verdict.supported and bool(rejected)
+                    and all(0 <= i < len(conclusions) for i in rejected)
+                    and all(issue.index in rejected for issue in verdict.issues))
                 failure = AIError("The semantic evidence check could not support every conclusion. Please review "
                                   "the sources or retry. No unverified analysis was saved.", "unverified_evidence")
-                failure.grounding_feedback = {"unsupported_statements": [conclusions[i].statement[:500]
-                    for i in verification.value.unsupported_indexes[:3] if 0 <= i < len(conclusions)],
+                if usable_indexes:
+                    failure.rejected_indexes = rejected
+                failure.grounding_feedback = {"unsupported_statements": [
+                    {"index": i, "statement": conclusions[i].statement[:500],
+                     "reason": next((issue.reason for issue in verdict.issues if issue.index == i),
+                                    "Not fully supported by its cited sources.")}
+                    for i in sorted(rejected)[:3] if 0 <= i < len(conclusions)],
                     "reason": "Statements must be fully supported by their cited sources; remove or qualify unsupported details."}
                 raise failure

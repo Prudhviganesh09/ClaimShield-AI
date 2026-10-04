@@ -322,6 +322,10 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
             raise HTTPException(422, "This report has no appeal paragraphs to export")
         sources = {source["chunk_id"]: source for source in analysis.result["sources"]}
         lines = ["DRAFT — HUMAN REVIEW REQUIRED", ""]
+        if analysis.result.get("insufficient_evidence"):
+            lines.extend(["INCOMPLETE — The evidence is insufficient for a complete assessment.", ""])
+        for note in analysis.result.get("verification_notes", []):
+            lines.extend([note, ""])
         for paragraph in paragraphs:
             lines.append(paragraph["statement"])
             for citation in paragraph["citations"]:

@@ -8,6 +8,7 @@ export type Finding = {statement: string; kind: "fact" | "inference"; citations:
 export type Analysis = {id: string; kind: string; question: string; model: string; fallback_used: boolean;
   created_at: string; result: {findings: Finding[]; recommendations: Finding[]; appeal_paragraphs: Finding[];
     missing_information: string[]; insufficient_evidence: boolean; sources: Source[]; evidence_revision: number;
+    verification_notes?: string[];
     assessment: {missing_documents: string[]; risk_flags: string[]; review_priority: string;
       evidence_confidence: number; confidence_explanation: string}}};
 export type Detail = Claim & {documents: Document[]; analyses: Analysis[]};
