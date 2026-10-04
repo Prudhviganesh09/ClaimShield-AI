@@ -1,0 +1,18 @@
+export type User = {id: string; name: string; email: string; role: string};
+export type Claim = {id: string; title: string; claim_number: string; insurer: string; amount: number | null;
+  status: string; review_notes: string; revision: number; created_at: string; updated_at: string};
+export type Document = {id: string; name: string; status: string; document_type: string; extraction_method: string;
+  confidence: number; fields: Record<string, string>; warnings: string[]; error: string | null};
+export type Source = {chunk_id: string; document_id: string; document_name: string; page: number; text: string};
+export type Finding = {statement: string; kind: "fact" | "inference"; citations: {chunk_id: string; quote: string}[]};
+export type Analysis = {id: string; kind: string; question: string; model: string; fallback_used: boolean;
+  created_at: string; result: {findings: Finding[]; recommendations: Finding[]; appeal_paragraphs: Finding[];
+    missing_information: string[]; insufficient_evidence: boolean; sources: Source[]; evidence_revision: number;
+    assessment: {missing_documents: string[]; risk_flags: string[]; review_priority: string;
+      evidence_confidence: number; confidence_explanation: string}}};
+export type Detail = Claim & {documents: Document[]; analyses: Analysis[]};
+export type Usage = {mode: string; requests: number; requests_today: number; requests_this_month: number;
+  token_estimate: number; average_latency_ms: number; rate_limit_events: number; failed_requests: number;
+  model_distribution: {model: string; requests: number}[]; cost_note: string};
+export type ProviderHealth = {configured: boolean; reachable: boolean; reasoning_model: string;
+  fast_model: string; embedding_model: string; last_checked: string; note: string};

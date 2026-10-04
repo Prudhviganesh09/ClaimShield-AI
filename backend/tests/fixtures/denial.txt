@@ -1,0 +1,7 @@
+SYNTHETIC TEST DOCUMENT
+Claim ID: TEST-1042
+Insurer: Example Health
+Denial code: AUTH-01
+Denial reason: Prior authorization record was not supplied.
+This fictional claim was denied pending submission of the authorization record.
+This file exists only to verify document upload and extraction behavior.
